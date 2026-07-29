@@ -153,22 +153,30 @@ export default async function handler(req, res) {
   const write = (obj) => res.write(JSON.stringify(obj) + "\n");
 
   try {
-    await Promise.all(
-      GROUP_DEFS.map(async (group) => {
-        try {
+      for (const group of GROUP_DEFS) {
+      try {
           const parsed = await callGroup(group, req.body, apiKey);
           Object.assign(merged, parsed);
-        } catch (err) {
+      } catch (err) {
           failed.push(group.label);
-          write({ type: "group-error", label: group.label, message: err.message });
-        } finally {
+          write({
+              type: "group-error",
+              label: group.label,
+              message: err.message
+          });
+      } finally {
           done += 1;
-          write({ type: "progress", label: group.label, done, total: GROUP_DEFS.length });
-        }
-      })
-    );
-
-    write({ type: "complete", data: merged, failed });
+          write({
+              type: "progress",
+              label: group.label,
+              done,
+              total: GROUP_DEFS.length
+          });
+      }
+  
+      // wait before next request
+      await sleep(15000); // 15 seconds
+  }
   } catch (err) {
     write({ type: "fatal", message: err.message || "Unexpected server error." });
   } finally {
