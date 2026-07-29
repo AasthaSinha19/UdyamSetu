@@ -42,7 +42,14 @@ Budget: ${form.budget}
 Draft this part of the startup blueprint for this venture. Ground it in the specific details above. Use ₹ (INR) figures where money is mentioned, sized to the stated budget band. Be concrete and specific, never generic filler.`;
 }
 
-async function callGroup(group, form, apiKey) {
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Gemini returns 503 when the model is overloaded and 429 on rate limits —
+// both are transient, so retry with exponential backoff before giving up.
+const RETRYABLE_STATUS = new Set([429, 503]);
+const MAX_ATTEMPTS = 4;
+
+async function callGeminiOnce(group, form, apiKey) {
   const systemPrompt = `Return ONLY valid JSON (no markdown fences, no commentary, no leading or trailing text) matching exactly this shape:\n${group.schema}`;
 
   const body = {
@@ -66,7 +73,9 @@ async function callGroup(group, form, apiKey) {
 
   if (!res.ok) {
     const errText = await res.text().catch(() => "");
-    throw new Error(`${group.label} — Gemini API error ${res.status}: ${errText.slice(0, 200)}`);
+    const err = new Error(`${group.label} — Gemini API error ${res.status}: ${errText.slice(0, 200)}`);
+    err.status = res.status;
+    throw err;
   }
 
   const data = await res.json();
@@ -79,6 +88,23 @@ async function callGroup(group, form, apiKey) {
   const end = cleaned.lastIndexOf("}");
   if (start === -1 || end === -1) throw new Error(`${group.label} — response wasn't JSON`);
   return JSON.parse(cleaned.slice(start, end + 1));
+}
+
+async function callGroup(group, form, apiKey) {
+  let lastErr;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await callGeminiOnce(group, form, apiKey);
+    } catch (err) {
+      lastErr = err;
+      const retryable = RETRYABLE_STATUS.has(err.status);
+      if (!retryable || attempt === MAX_ATTEMPTS) throw err;
+      // exponential backoff with jitter: ~600ms, ~1.2s, ~2.4s
+      const delay = 600 * 2 ** (attempt - 1) + Math.random() * 300;
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
 }
 
 function validateForm(form) {
