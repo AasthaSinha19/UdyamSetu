@@ -1,142 +1,285 @@
-// Vercel serverless function — POST /api/generate-plan
-// Calls Google Gemini (not Anthropic) to draft the startup blueprint.
-// Requires env var GEMINI_API_KEY, set in Vercel Project Settings.
+// Vercel Serverless Function
+// POST /api/generate-plan
+// Uses ONE Gemini request instead of four parallel requests.
 
 export const config = {
-  maxDuration: 60, // allow up to 60s (Hobby plan ceiling) for the 4 parallel Gemini calls
+  maxDuration: 60,
 };
 
 const GEMINI_MODEL = "gemini-3.5-flash";
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-/* Same four-group split used on the client, kept here as the single
-   source of truth. Splitting the ask keeps each completion small and
-   lets the client show real per-group progress instead of a spinner. */
-const GROUP_DEFS = [
-  {
-    label: "A-01 – A-03 · Foundations",
-    schema: `{"executiveSummary": "string, 3-4 short paragraphs separated by a blank line", "marketAnalysis": "string, 2-3 short paragraphs, may include lines starting with '- ' for key stats", "competitors": [ {"name": "string", "type": "Direct or Indirect", "strength": "string", "weakness": "string"} ] (3 to 4 items)}`,
-  },
-  {
-    label: "A-04 – A-06 · Strategy & Roadmap",
-    schema: `{"swot": {"strengths": ["string", "..."], "weaknesses": ["string", "..."], "opportunities": ["string", "..."], "threats": ["string", "..."]} (3 to 5 bullets each), "revenueModel": "string, paragraphs and '- ' bullet lines for concrete revenue streams", "mvpRoadmap": [ {"phase": "string", "duration": "string", "features": ["string", "..."]} ] (3 to 5 phases)}`,
-  },
-  {
-    label: "A-07 – A-09 · Execution & Pitch",
-    schema: `{"techStack": {"frontend": ["string", "..."], "backend": ["string", "..."], "database": ["string", "..."], "infrastructure": ["string", "..."]}, "marketingStrategy": "string, paragraphs and '- ' bullets, channel-specific and budget-appropriate", "investorPitch": "string, paragraphs covering hook, problem, solution, market size, traction plan, and the ask"}`,
-  },
-  {
-    label: "A-10 – A-13 · Risk & Funding",
-    schema: `{"risks": [ {"risk": "string", "impact": "High, Medium or Low", "mitigation": "string"} ] (4 to 5 items), "fundingSuggestions": "string, paragraphs and '- ' bullets naming concrete funding routes fitting the stage and budget", "businessModelCanvas": {"keyPartners":"string","keyActivities":"string","keyResources":"string","valueProposition":"string","customerRelationships":"string","channels":"string","customerSegments":"string","costStructure":"string","revenueStreams":"string"}, "actionPlan": [ {"week": "Week 1", "focus": "string", "tasks": ["string", "..."]} ] (exactly 4 items covering 30 days)}`,
-  },
-];
-
-function buildUserPrompt(form) {
-  return `Startup Name: ${form.name}
-Startup Idea: ${form.idea}
-Industry: ${form.industry}
-Target Audience: ${form.audience}
-Business Stage: ${form.stage}
-Budget: ${form.budget}
-
-Draft this part of the startup blueprint for this venture. Ground it in the specific details above. Use ₹ (INR) figures where money is mentioned, sized to the stated budget band. Be concrete and specific, never generic filler.`;
-}
+const GEMINI_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Gemini returns 503 when the model is overloaded and 429 on rate limits —
-// both are transient, so retry with exponential backoff before giving up.
-const RETRYABLE_STATUS = new Set([429, 503]);
-const MAX_ATTEMPTS = 4;
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
 
-async function callGeminiOnce(group, form, apiKey) {
-  const systemPrompt = `Return ONLY valid JSON (no markdown fences, no commentary, no leading or trailing text) matching exactly this shape:\n${group.schema}`;
+const MAX_ATTEMPTS = 3;
 
-  const body = {
-    contents: [{ role: "user", parts: [{ text: buildUserPrompt(form) }] }],
-    systemInstruction: { parts: [{ text: systemPrompt }] },
-    generationConfig: {
-      responseMimeType: "application/json",
-      maxOutputTokens: 2048,
-      temperature: 0.7,
-    },
-  };
+const BLUEPRINT_SCHEMA = `
+{
+  "executiveSummary": "string",
+  "marketAnalysis": "string",
 
-  const res = await fetch(GEMINI_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-goog-api-key": apiKey,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    const err = new Error(`${group.label} — Gemini API error ${res.status}: ${errText.slice(0, 200)}`);
-    err.status = res.status;
-    throw err;
-  }
-
-  const data = await res.json();
-  const textBlock = (data?.candidates?.[0]?.content?.parts || [])
-    .map((p) => p.text || "")
-    .join("\n");
-
-  const cleaned = textBlock.replace(/```json/g, "").replace(/```/g, "").trim();
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end === -1) throw new Error(`${group.label} — response wasn't JSON`);
-  return JSON.parse(cleaned.slice(start, end + 1));
-}
-
-async function callGroup(group, form, apiKey) {
-  let lastErr;
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      return await callGeminiOnce(group, form, apiKey);
-    } catch (err) {
-      lastErr = err;
-      const retryable = RETRYABLE_STATUS.has(err.status);
-      if (!retryable || attempt === MAX_ATTEMPTS) throw err;
-      // exponential backoff with jitter: ~600ms, ~1.2s, ~2.4s
-      const delay = 600 * 2 ** (attempt - 1) + Math.random() * 300;
-      await sleep(delay);
+  "competitors": [
+    {
+      "name": "string",
+      "type": "Direct | Indirect",
+      "strength": "string",
+      "weakness": "string"
     }
-  }
-  throw lastErr;
+  ],
+
+  "swot": {
+    "strengths": [],
+    "weaknesses": [],
+    "opportunities": [],
+    "threats": []
+  },
+
+  "revenueModel": "string",
+
+  "mvpRoadmap": [
+    {
+      "phase": "string",
+      "duration": "string",
+      "features": []
+    }
+  ],
+
+  "techStack": {
+    "frontend": [],
+    "backend": [],
+    "database": [],
+    "infrastructure": []
+  },
+
+  "marketingStrategy": "string",
+
+  "investorPitch": "string",
+
+  "risks": [
+    {
+      "risk": "string",
+      "impact": "High | Medium | Low",
+      "mitigation": "string"
+    }
+  ],
+
+  "fundingSuggestions": "string",
+
+  "businessModelCanvas": {
+    "keyPartners": "",
+    "keyActivities": "",
+    "keyResources": "",
+    "valueProposition": "",
+    "customerRelationships": "",
+    "channels": "",
+    "customerSegments": "",
+    "costStructure": "",
+    "revenueStreams": ""
+  },
+
+  "actionPlan": [
+    {
+      "week": "Week 1",
+      "focus": "",
+      "tasks": []
+    }
+  ]
+}
+`;
+
+function buildPrompt(form) {
+  return `
+You are an experienced Startup Consultant.
+
+Generate a COMPLETE startup blueprint.
+
+Return ONLY VALID JSON.
+
+No markdown.
+No explanation.
+No code fences.
+
+Use this exact schema:
+
+${BLUEPRINT_SCHEMA}
+
+Startup Name:
+${form.name}
+
+Startup Idea:
+${form.idea}
+
+Industry:
+${form.industry}
+
+Target Audience:
+${form.audience}
+
+Business Stage:
+${form.stage}
+
+Budget:
+${form.budget}
+
+Requirements:
+
+- Make everything highly specific.
+- Never use placeholders.
+- Use INR (₹) wherever money is mentioned.
+- SWOT should have 4-5 points each.
+- Competitors should contain 4 companies.
+- MVP roadmap should contain 4 phases.
+- Risks should contain 5 items.
+- Action plan should contain exactly 4 weeks.
+- Marketing strategy should be practical.
+- Revenue model should include realistic pricing.
+- Investor pitch should be convincing.
+`;
 }
 
 function validateForm(form) {
-  if (!form || typeof form !== "object") return "Missing form data.";
-  const required = ["name", "idea", "industry", "audience", "stage", "budget"];
+  if (!form || typeof form !== "object")
+    return "Missing form data.";
+
+  const required = [
+    "name",
+    "idea",
+    "industry",
+    "audience",
+    "stage",
+    "budget",
+  ];
+
   for (const field of required) {
-    if (!form[field] || !String(form[field]).trim()) return `Missing field: ${field}`;
+    if (!form[field] || !String(form[field]).trim())
+      return `Missing field: ${field}`;
   }
+
   return null;
 }
+async function callGemini(form, apiKey) {
+  const body = {
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            text: buildPrompt(form),
+          },
+        ],
+      },
+    ],
 
-/* Streams newline-delimited JSON events so the UI can show real,
-   per-group progress instead of a spinner:
-     {"type":"progress","label":"...","done":1,"total":4}
-     {"type":"group-error","label":"...","message":"..."}
-     {"type":"complete","data":{...}, "failed":["..."]}
-     {"type":"fatal","message":"..."} */
+    generationConfig: {
+      temperature: 0.7,
+      topP: 0.95,
+      topK: 40,
+      maxOutputTokens: 8192,
+      responseMimeType: "application/json",
+    },
+  };
+
+  let lastError;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      const response = await fetch(GEMINI_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": apiKey,
+        },
+        body: JSON.stringify(body),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+
+        const error = new Error(
+          `Gemini API ${response.status}: ${text.slice(0, 300)}`
+        );
+
+        error.status = response.status;
+
+        throw error;
+      }
+
+      const json = await response.json();
+
+      const text =
+        json?.candidates?.[0]?.content?.parts
+          ?.map((p) => p.text || "")
+          .join("\n") || "";
+
+      if (!text.trim()) {
+        throw new Error("Gemini returned an empty response.");
+      }
+
+      const cleaned = text
+        .replace(/```json/g, "")
+        .replace(/```/g, "")
+        .trim();
+
+      const start = cleaned.indexOf("{");
+      const end = cleaned.lastIndexOf("}");
+
+      if (start === -1 || end === -1) {
+        throw new Error("Gemini did not return valid JSON.");
+      }
+
+      const parsed = JSON.parse(
+        cleaned.substring(start, end + 1)
+      );
+
+      return parsed;
+    } catch (err) {
+      lastError = err;
+
+      const retryable =
+        RETRYABLE_STATUS.has(err.status) ||
+        err.name === "AbortError";
+
+      if (!retryable || attempt === MAX_ATTEMPTS) {
+        throw err;
+      }
+
+      const delay =
+        1000 * Math.pow(2, attempt - 1) +
+        Math.floor(Math.random() * 500);
+
+      await sleep(delay);
+    }
+  }
+
+  throw lastError;
+}
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    res.status(405).json({ error: "Method not allowed" });
+    res.status(405).json({
+      error: "Method not allowed",
+    });
     return;
   }
 
   const validationError = validateForm(req.body);
+
   if (validationError) {
-    res.status(400).json({ error: validationError });
+    res.status(400).json({
+      error: validationError,
+    });
     return;
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
+
   if (!apiKey) {
-    res.status(500).json({ error: "Server is missing GEMINI_API_KEY." });
+    res.status(500).json({
+      error: "Server is missing GEMINI_API_KEY.",
+    });
     return;
   }
 
@@ -146,39 +289,64 @@ export default async function handler(req, res) {
     Connection: "keep-alive",
   });
 
-  const merged = {};
-  const failed = [];
-  let done = 0;
-
-  const write = (obj) => res.write(JSON.stringify(obj) + "\n");
+  const write = (obj) => {
+    res.write(JSON.stringify(obj) + "\n");
+  };
 
   try {
-      for (const group of GROUP_DEFS) {
-      try {
-          const parsed = await callGroup(group, req.body, apiKey);
-          Object.assign(merged, parsed);
-      } catch (err) {
-          failed.push(group.label);
-          write({
-              type: "group-error",
-              label: group.label,
-              message: err.message
-          });
-      } finally {
-          done += 1;
-          write({
-              type: "progress",
-              label: group.label,
-              done,
-              total: GROUP_DEFS.length
-          });
-      }
-  
-      // wait before next request
-      await sleep(15000); // 15 seconds
-  }
+    // Fake progress so the frontend UI still animates
+    write({
+      type: "progress",
+      label: "Analyzing startup idea...",
+      done: 1,
+      total: 4,
+    });
+
+    await sleep(300);
+
+    write({
+      type: "progress",
+      label: "Generating business strategy...",
+      done: 2,
+      total: 4,
+    });
+
+    await sleep(300);
+
+    write({
+      type: "progress",
+      label: "Preparing financials & roadmap...",
+      done: 3,
+      total: 4,
+    });
+
+    // Single Gemini request
+    const blueprint = await callGemini(req.body, apiKey);
+
+    write({
+      type: "progress",
+      label: "Finalizing startup blueprint...",
+      done: 4,
+      total: 4,
+    });
+
+    write({
+      type: "complete",
+      data: blueprint,
+      failed: [],
+    });
+
   } catch (err) {
-    write({ type: "fatal", message: err.message || "Unexpected server error." });
+
+    console.error(err);
+
+    write({
+      type: "fatal",
+      message:
+        err.message ||
+        "Failed to generate startup blueprint.",
+    });
+
   } finally {
     res.end();
   }
